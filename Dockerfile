@@ -47,7 +47,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app" \
     PYTHONFAULTHANDLER=1 \
     PROMETHEUS_MCP_BIND_HOST=0.0.0.0 \
-    PROMETHEUS_MCP_BIND_PORT=8080
+    PROMETHEUS_MCP_BIND_PORT=8080 \
+    PROMETHEUS_MCP_SERVER_TRANSPORT=sse
 
 USER app
 
@@ -61,23 +62,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
         fi
 
 CMD ["/app/.venv/bin/prometheus-mcp-server"]
-
-LABEL org.opencontainers.image.title="Prometheus MCP Server" \
-      org.opencontainers.image.description="Model Context Protocol server for Prometheus integration, enabling AI assistants to query metrics and monitor system health" \
-      org.opencontainers.image.version="1.6.2" \
-      org.opencontainers.image.authors="Pavel Shklovsky <pavel@cloudefined.com>" \
-      org.opencontainers.image.source="https://github.com/pab1it0/prometheus-mcp-server" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.url="https://github.com/pab1it0/prometheus-mcp-server" \
-      org.opencontainers.image.documentation="https://github.com/pab1it0/prometheus-mcp-server/blob/main/docs/" \
-      org.opencontainers.image.vendor="Pavel Shklovsky" \
-      org.opencontainers.image.base.name="python:3.12-slim-bookworm" \
-      org.opencontainers.image.created="" \
-      org.opencontainers.image.revision="" \
-      io.modelcontextprotocol.server.name="io.github.pab1it0/prometheus-mcp-server" \
-      mcp.server.name="prometheus-mcp-server" \
-      mcp.server.category="monitoring" \
-      mcp.server.tags="prometheus,monitoring,metrics,observability" \
-      mcp.server.transport.stdio="true" \
-      mcp.server.transport.http="true" \
-      mcp.server.transport.sse="true"
