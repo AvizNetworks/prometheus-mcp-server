@@ -2,10 +2,11 @@
 
 import os
 import json
+import re
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 import dotenv
@@ -21,6 +22,72 @@ TOOL_PREFIX = os.environ.get("TOOL_PREFIX", "")
 def _tool_name(name: str) -> str:
     """Build tool name with optional prefix."""
     return f"{TOOL_PREFIX}_{name}" if TOOL_PREFIX else name
+
+# Relative time expressions LLM callers commonly send ("now", "now-6h",
+# "-30m", "24h ago"). The Prometheus HTTP API only accepts RFC3339 or unix
+# timestamps and answers 400 otherwise, so translate these server-side —
+# deterministic here, unreliable if left to the model (which may not even
+# know the current wall-clock time).
+_RELATIVE_TIME_RE = re.compile(
+    r"^(?:now(?:-(\d+)([smhdw]))?|-(\d+)([smhdw])|(\d+)([smhdw])\s*ago)$"
+)
+_TIME_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _iso_ts(ts):
+    """Unix timestamp -> RFC 3339 UTC string (e.g. "2025-08-17T20:43:42Z").
+
+    Strict RFC 3339 on purpose: timezone-explicit, lexicographically sortable,
+    parseable by every downstream date parser, and the same format the
+    Prometheus API accepts as input. Presentation-level shortening (HH:MM
+    ticks for an intraday chart) belongs to the render layer, which knows the
+    window — never to the data. Unparseable input passes through.
+    """
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ts
+
+
+def _humanize_result_timestamps(result_entries):
+    """Convert sample timestamps in a query result to readable UTC strings.
+
+    This server's responses are consumed by LLM agents (and, through them,
+    chart-rendering tools); raw epoch seconds make x-axis labels and evidence
+    quotes unreadable. Values stay untouched — only timestamps change.
+    """
+    for series in result_entries or []:
+        if not isinstance(series, dict):
+            continue
+        values = series.get("values")
+        if isinstance(values, list):
+            series["values"] = [
+                [_iso_ts(p[0]), *p[1:]] if isinstance(p, list) and p else p
+                for p in values
+            ]
+        value = series.get("value")
+        if isinstance(value, list) and value:
+            series["value"] = [_iso_ts(value[0]), *value[1:]]
+    return result_entries
+
+
+def _coerce_time(value):
+    """Translate a relative time expression to a unix timestamp string.
+
+    RFC3339 / unix inputs (and anything unrecognized) pass through untouched,
+    so existing callers are unaffected.
+    """
+    if value is None:
+        return value
+    m = _RELATIVE_TIME_RE.match(str(value).strip().lower().replace(" ", ""))
+    if not m:
+        return value
+    num = m.group(1) or m.group(3) or m.group(5)
+    unit = m.group(2) or m.group(4) or m.group(6)
+    offset = int(num) * _TIME_UNITS[unit] if num else 0
+    return str(round(time.time() - offset, 3))
 
 # Include prefix in MCP server name if set
 mcp_name = f"Prometheus MCP ({TOOL_PREFIX})" if TOOL_PREFIX else "Prometheus MCP"
@@ -292,34 +359,40 @@ async def execute_query(query: str, time: Optional[str] = None) -> Dict[str, Any
 
     Args:
         query: PromQL query string
-        time: Optional RFC3339 or Unix timestamp (default: current time)
+        time: Optional evaluation time — RFC3339, Unix timestamp, or relative
+            (e.g. 'now-1h'); default: current time
 
     Returns:
         Query result with type (vector, matrix, scalar, string) and values
     """
     params = {"query": query}
     if time:
-        params["time"] = time
-    
-    logger.info("Executing instant query", query=query, time=time)
+        params["time"] = _coerce_time(time)
+
+    logger.info("Executing instant query", query=query, time=params.get("time"))
     data = make_prometheus_request("query", params=params)
 
     result = {
         "resultType": data["resultType"],
-        "result": data["result"]
+        "result": _humanize_result_timestamps(data["result"])
+        if isinstance(data["result"], list)
+        else data["result"]
     }
 
-    if not config.disable_prometheus_links:
-        from urllib.parse import urlencode
-        ui_params = {"g0.expr": query, "g0.tab": "0"}
-        if time:
-            ui_params["g0.moment_input"] = time
-        prometheus_ui_link = f"{config.url.rstrip('/')}/graph?{urlencode(ui_params)}"
-        result["links"] = [{
-            "href": prometheus_ui_link,
-            "rel": "prometheus-ui",
-            "title": "View in Prometheus UI"
-        }]
+    # NCP: Prometheus-UI link injection disabled — all visuals (tables/charts)
+    # are rendered by the platform UI tools, so responses must carry data only.
+    # Uncomment to re-enable (PROMETHEUS_DISABLE_LINKS config still applies).
+    # if not config.disable_prometheus_links:
+    #     from urllib.parse import urlencode
+    #     ui_params = {"g0.expr": query, "g0.tab": "0"}
+    #     if time:
+    #         ui_params["g0.moment_input"] = time
+    #     prometheus_ui_link = f"{config.url.rstrip('/')}/graph?{urlencode(ui_params)}"
+    #     result["links"] = [{
+    #         "href": prometheus_ui_link,
+    #         "rel": "prometheus-ui",
+    #         "title": "View in Prometheus UI"
+    #     }]
 
     logger.info("Instant query completed",
                 query=query,
@@ -345,8 +418,8 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
 
     Args:
         query: PromQL query string
-        start: Start time as RFC3339 or Unix timestamp
-        end: End time as RFC3339 or Unix timestamp
+        start: Start time as RFC3339, Unix timestamp, or relative (e.g. 'now-6h')
+        end: End time as RFC3339, Unix timestamp, or relative (e.g. 'now')
         step: Query resolution step width (e.g., '15s', '1m', '1h')
 
     Returns:
@@ -354,12 +427,13 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
     """
     params = {
         "query": query,
-        "start": start,
-        "end": end,
+        "start": _coerce_time(start),
+        "end": _coerce_time(end),
         "step": step
     }
 
-    logger.info("Executing range query", query=query, start=start, end=end, step=step)
+    logger.info("Executing range query", query=query,
+                start=params["start"], end=params["end"], step=step)
 
     # Report progress if context available
     if ctx:
@@ -373,23 +447,28 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
 
     result = {
         "resultType": data["resultType"],
-        "result": data["result"]
+        "result": _humanize_result_timestamps(data["result"])
+        if isinstance(data["result"], list)
+        else data["result"]
     }
 
-    if not config.disable_prometheus_links:
-        from urllib.parse import urlencode
-        ui_params = {
-            "g0.expr": query,
-            "g0.tab": "0",
-            "g0.range_input": f"{start} to {end}",
-            "g0.step_input": step
-        }
-        prometheus_ui_link = f"{config.url.rstrip('/')}/graph?{urlencode(ui_params)}"
-        result["links"] = [{
-            "href": prometheus_ui_link,
-            "rel": "prometheus-ui",
-            "title": "View in Prometheus UI"
-        }]
+    # NCP: Prometheus-UI link injection disabled — all visuals (tables/charts)
+    # are rendered by the platform UI tools, so responses must carry data only.
+    # Uncomment to re-enable (PROMETHEUS_DISABLE_LINKS config still applies).
+    # if not config.disable_prometheus_links:
+    #     from urllib.parse import urlencode
+    #     ui_params = {
+    #         "g0.expr": query,
+    #         "g0.tab": "0",
+    #         "g0.range_input": f"{start} to {end}",
+    #         "g0.step_input": step
+    #     }
+    #     prometheus_ui_link = f"{config.url.rstrip('/')}/graph?{urlencode(ui_params)}"
+    #     result["links"] = [{
+    #         "href": prometheus_ui_link,
+    #         "rel": "prometheus-ui",
+    #         "title": "View in Prometheus UI"
+    #     }]
 
     # Report completion
     if ctx:
