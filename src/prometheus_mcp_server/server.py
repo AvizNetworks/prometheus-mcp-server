@@ -34,6 +34,40 @@ _RELATIVE_TIME_RE = re.compile(
 _TIME_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
+# Range results are consumed by an LLM: 14 series x 288 full-resolution points
+# is ~130KB of prompt (~30K tokens) and multi-minute prefill, while a chart or
+# trend read needs far fewer points. Cap per-series points by stride-sampling
+# (first + last always kept) — same convention as NCP's dedicated trend tools.
+DEFAULT_MAX_POINTS = int(os.environ.get("PROMETHEUS_MAX_RANGE_POINTS", "100"))
+
+
+def _downsample_series(result_entries, max_points):
+    """Stride-sample each series' values down to <= max_points (+ last point).
+
+    Annotates downsampled series with {original_points, returned_points} so
+    the caller knows resolution was reduced. No-op when max_points <= 0 or a
+    series is already within budget.
+    """
+    if not max_points or max_points <= 0:
+        return result_entries
+    for series in result_entries or []:
+        if not isinstance(series, dict):
+            continue
+        values = series.get("values")
+        if not isinstance(values, list) or len(values) <= max_points:
+            continue
+        stride = -(-len(values) // max_points)  # ceil division
+        sampled = values[::stride]
+        if sampled[-1] is not values[-1]:
+            sampled.append(values[-1])  # never drop the most recent point
+        series["values"] = sampled
+        series["downsampled"] = {
+            "original_points": len(values),
+            "returned_points": len(sampled),
+        }
+    return result_entries
+
+
 def _iso_ts(ts):
     """Unix timestamp -> RFC 3339 UTC string (e.g. "2025-08-17T20:43:42Z").
 
@@ -413,7 +447,7 @@ async def execute_query(query: str, time: Optional[str] = None) -> Dict[str, Any
         "openWorldHint": True
     }
 )
-async def execute_range_query(query: str, start: str, end: str, step: str, ctx: Context | None = None) -> Dict[str, Any]:
+async def execute_range_query(query: str, start: str, end: str, step: str, max_points: Optional[int] = None, ctx: Context | None = None) -> Dict[str, Any]:
     """Execute a range query against Prometheus.
 
     Args:
@@ -421,6 +455,10 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
         start: Start time as RFC3339, Unix timestamp, or relative (e.g. 'now-6h')
         end: End time as RFC3339, Unix timestamp, or relative (e.g. 'now')
         step: Query resolution step width (e.g., '15s', '1m', '1h')
+        max_points: Per-series point cap (default 100, env
+            PROMETHEUS_MAX_RANGE_POINTS). Series beyond it are stride-sampled
+            (first/last kept) and annotated with a `downsampled` field.
+            Pass 0 to disable and return full resolution.
 
     Returns:
         Range query result with type (usually matrix) and values over time
@@ -445,11 +483,14 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
     if ctx:
         await ctx.report_progress(progress=50, total=100, message="Processing query results...")
 
+    effective_max_points = DEFAULT_MAX_POINTS if max_points is None else max_points
+    result_entries = data["result"]
+    if isinstance(result_entries, list):
+        result_entries = _downsample_series(result_entries, effective_max_points)
+        result_entries = _humanize_result_timestamps(result_entries)
     result = {
         "resultType": data["resultType"],
-        "result": _humanize_result_timestamps(data["result"])
-        if isinstance(data["result"], list)
-        else data["result"]
+        "result": result_entries
     }
 
     # NCP: Prometheus-UI link injection disabled — all visuals (tables/charts)
